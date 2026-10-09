@@ -1,11 +1,52 @@
 """QGeo browser workspace. Run: streamlit run app.py"""
 import hashlib
 import io
+from pathlib import Path
 import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageOps
 from core import analyse, csv_bytes, export_zip, segment
+
+
+def show_about():
+    st.subheader("About QGeo")
+    st.write("QGeo supports image-based geological characterisation through colour segmentation, interactive class refinement and shape measurements.")
+    st.caption("Original software: Geology Quantifier · University of Chile. This website provides a browser interface to the processing workflow.")
+    st.subheader("Publications using QGeo")
+    st.write("The following publications used the software. When reporting work with QGeo, acknowledge the software and cite the publications relevant to your methods.")
+    papers = [
+        ("Geological characterisation methods for IOCG samples, resolution comparison and considerations for productive stages of mining",
+         "Stocker, F., Lois-Morales, P., & Suzuki Morales, K. (2025). International Journal of Mining, Reclamation and Environment, 39(10), 839–868.",
+         "10.1080/17480930.2025.2518988"),
+        ("Particle-scale size effects on the mechanical behavior of iron-bearing rocks relevant to comminution processes",
+         "Stocker, F., Lois-Morales, P., & Suzuki Morales, K. (2027). Powder Technology, 485, 123013.",
+         "10.1016/j.powtec.2026.123013"),
+        ("Influence of Index Properties and Semi-Quantitative Geological Characteristics of Brittle Rocks on Their Post-Peak Behavior",
+         "Flores, S., Suzuki Morales, K., & Lois-Morales, P. (2024). Rock Mechanics and Rock Engineering, 57(9), 6663–6682.",
+         "10.1007/s00603-024-03879-6"),
+    ]
+    citations = []
+    for title, reference, doi in papers:
+        with st.container(border=True):
+            st.markdown(f"[{title}](https://doi.org/{doi})")
+            st.write(reference)
+            st.caption(f"DOI: {doi}")
+        citations.append(f"{reference}\n{title}\nhttps://doi.org/{doi}")
+    st.caption("The Powder Technology reference uses the journal's assigned 2027 issue year; its DOI contains 2026.")
+    st.download_button("Download publication references", "\n\n".join(citations), "QGeo_publications.txt", "text/plain")
+    st.subheader("Licence and attribution")
+    st.write("Copyright 2023 Dr Pia Lois-Morales and Dr Kimie Suzuki.")
+    st.write("QGeo is licensed under the Apache License, Version 2.0.")
+    st.markdown("[Read the official Apache 2.0 licence](https://www.apache.org/licenses/LICENSE-2.0)")
+    licence_path = Path(__file__).resolve().with_name("LICENSE")
+    if licence_path.is_file():
+        licence = licence_path.read_text(encoding="utf-8")
+        with st.expander("Full licence text"):
+            st.code(licence, language=None)
+        st.download_button("Download licence", licence, "LICENSE.txt", "text/plain")
+    st.caption("The software licence covers QGeo code. Journal articles retain their respective publisher licences.")
+    st.markdown("[Original software repository](https://github.com/ploism/geology-quantifier) · [Web application repository](https://github.com/ploism/QGeo_webversion)")
 
 
 def navigate(view):
@@ -39,8 +80,13 @@ h1 {font-size: 1.8rem !important;}
 </style>""", unsafe_allow_html=True)
 st.title("QGeo Web")
 with st.sidebar:
+    page = st.radio("Page", ["Image workspace", "About QGeo"], key="page")
     st.subheader("Image")
     uploaded = st.file_uploader("Rock image", type=["jpg", "jpeg", "png", "tif", "tiff"])
+    st.caption("© 2023 Dr Pia Lois-Morales and Dr Kimie Suzuki · Apache 2.0")
+if page == "About QGeo":
+    show_about()
+    st.stop()
 if uploaded is None:
     st.info("Upload a rock image using the left panel to open the workspace.")
     st.stop()
