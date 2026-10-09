@@ -1,12 +1,15 @@
 """QGeo browser workspace. Run: streamlit run app.py"""
 import hashlib
 import io
+import json
+from copy import deepcopy
 from pathlib import Path
 import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageOps
 from core import analyse, csv_bytes, export_zip, segment
+from protocol import class_colours, load_protocol, make_protocol, replay
 
 
 def show_about():
@@ -64,7 +67,9 @@ def preview(image, size=(420, 230)):
 
 def checkpoint():
     history = st.session_state.setdefault("history", [])
-    history.append((list(st.session_state.masks), list(st.session_state.names)))
+    history.append((list(st.session_state.masks), list(st.session_state.names),
+                    deepcopy(st.session_state.get("protocol_steps", [])),
+                    st.session_state.get("initial_clusters", 3)))
     st.session_state.history = history[-10:]
 
 
@@ -92,7 +97,7 @@ if uploaded is None:
     st.stop()
 digest = hashlib.sha256(uploaded.getvalue()).hexdigest()
 if st.session_state.get("source_digest") != digest:
-    for key in ("masks", "names", "crop_key", "bounds", "history"):
+    for key in ("masks", "names", "crop_key", "bounds", "history", "protocol_steps", "protocol_report"):
         st.session_state.pop(key, None)
     st.session_state.source_digest = digest
     st.session_state.workspace = "Crop"
@@ -127,7 +132,7 @@ crop = original[y0:y1, x0:x1].copy()
 crop_key = (digest, x0, x1, y0, y1)
 if st.session_state.get("crop_key") != crop_key:
     st.session_state.crop_key = crop_key
-    for key in ("masks", "names", "history"):
+    for key in ("masks", "names", "history", "protocol_steps", "protocol_report"):
         st.session_state.pop(key, None)
     st.session_state.revision = st.session_state.get("revision", 0) + 1
 
@@ -154,10 +159,42 @@ if view == "Analyse":
                 st.session_state.masks = new_masks
                 st.session_state.names = [f"Class {i+1}" for i in range(count)]
                 st.session_state.initial_clusters = int(count)
+                st.session_state.protocol_steps = [dict(op="segment", count=int(count), colours=class_colours(crop, new_masks))]
+                st.session_state.pop("protocol_report", None)
                 changed()
             except ValueError as error:
                 st.error(str(error))
         grid_columns = st.slider("Images per row", 2, 6, 4)
+        with st.expander("Saved protocol", expanded="masks" not in st.session_state):
+            protocol_upload = st.file_uploader("Load protocol (JSON)", type=["json"], key="protocol_upload")
+            if protocol_upload is not None:
+                protocol_digest = hashlib.sha256(protocol_upload.getvalue()).hexdigest()
+                if st.session_state.get("loaded_protocol_digest") != protocol_digest:
+                    try:
+                        st.session_state.saved_protocol = load_protocol(protocol_upload.getvalue())
+                        st.session_state.loaded_protocol_digest = protocol_digest
+                    except ValueError as error:
+                        st.error(str(error))
+            saved = st.session_state.get("saved_protocol")
+            if saved:
+                st.caption(f"{saved.get('name', 'Protocol')} · {len(saved['steps'])} steps")
+                st.caption("Uses colour correspondence. Check the resulting classes on every image. Crop and calibration are set separately.")
+            if st.button("Apply saved protocol", disabled=not saved, width="stretch"):
+                try:
+                    with st.spinner("Applying saved operations…"):
+                        new_masks, new_names, differences = replay(crop, saved)
+                    if "masks" in st.session_state:
+                        checkpoint()
+                    st.session_state.masks = new_masks
+                    st.session_state.names = new_names
+                    st.session_state.protocol_steps = deepcopy(saved["steps"])
+                    st.session_state.initial_clusters = saved["steps"][0]["count"]
+                    st.session_state.protocol_report = max(differences, default=0.0)
+                    changed()
+                except ValueError as error:
+                    st.error(str(error))
+    if "protocol_report" in st.session_state:
+        st.info("Protocol applied using colour correspondence. Review the class images before interpreting mineral labels.")
     if "masks" not in st.session_state:
         st.image(preview(crop, (800, 530)), width="stretch")
         st.info("Choose the number of colour classes in the left panel, then select Segment crop.")
@@ -198,6 +235,7 @@ if view == "Analyse":
             keep = [i for i in range(len(masks)) if i not in selected]
             st.session_state.masks = [masks[i] for i in keep] + [merged]
             st.session_state.names = [names[i] for i in keep] + ["Merged class"]
+            st.session_state.setdefault("protocol_steps", []).append(dict(op="merge", indices=list(selected)))
             changed()
         split_count = st.number_input("Classes after splitting", 2, 12, 2)
         if st.button("Split selected", disabled=len(selected) != 1, width="stretch"):
@@ -207,6 +245,7 @@ if view == "Analyse":
                 checkpoint()
                 st.session_state.masks = masks[:index] + children + masks[index+1:]
                 st.session_state.names = names[:index] + [f"{names[index]} part {j+1}" for j in range(split_count)] + names[index+1:]
+                st.session_state.setdefault("protocol_steps", []).append(dict(op="split", index=index, count=int(split_count), colours=class_colours(crop, children)))
                 changed()
             except ValueError as error:
                 st.error(str(error))
@@ -215,10 +254,33 @@ if view == "Analyse":
             keep = [i for i in range(len(masks)) if i not in selected]
             st.session_state.masks = [masks[i] for i in keep]
             st.session_state.names = [names[i] for i in keep]
+            st.session_state.setdefault("protocol_steps", []).append(dict(op="remove", indices=list(selected)))
             changed()
         if st.button("Undo last change", disabled=not st.session_state.get("history"), width="stretch"):
-            st.session_state.masks, st.session_state.names = st.session_state.history.pop()
+            st.session_state.masks, st.session_state.names, st.session_state.protocol_steps, st.session_state.initial_clusters = st.session_state.history.pop()
+            st.session_state.pop("protocol_report", None)
             changed()
+        with st.expander("Save this protocol"):
+            protocol_name = st.text_input("Protocol name", value="My QGeo protocol")
+            steps = st.session_state.get("protocol_steps", [])
+            if steps and steps[0]["op"] == "segment":
+                try:
+                    current_protocol = make_protocol(protocol_name, steps, names)
+                    st.caption(f"{len(steps)} recorded operations. Final class names are included.")
+                    st.download_button("Download protocol (JSON)", json.dumps(current_protocol, indent=2, ensure_ascii=False), "QGeo_protocol.json", "application/json")
+                    if st.button("Keep for next image", width="stretch"):
+                        st.session_state.saved_protocol = deepcopy(current_protocol)
+                        st.success("Protocol kept for the next image in this session. Download it for future sessions.")
+                    with st.expander("Recorded steps"):
+                        for number, step in enumerate(steps, 1):
+                            suffix = f" → {step['count']} classes" if "count" in step else ""
+                            target = (f" (class {step['index']+1})" if "index" in step else
+                                      f" (classes {', '.join(str(i+1) for i in step['indices'])})" if "indices" in step else "")
+                            st.caption(f"{number}. {step['op']}{target}{suffix}")
+                except ValueError as error:
+                    st.warning(str(error))
+            else:
+                st.caption("Start with Segment crop to record a complete protocol.")
         st.button("View measurements", on_click=navigate, args=("Results",), width="stretch")
     st.caption("Colour classes require user interpretation before assigning mineral names. Mask percentages use the whole crop.")
     st.stop()
@@ -253,7 +315,8 @@ else:
 metadata = dict(source=uploaded.name, original_size=[w,h], crop=[x0,y0,x1,y1],
                 physical_crop_height_mm=physical_height, mm_per_pixel=scale,
                 minimum_contour_area_px=minimum_area, class_names=names,
-                seed=0, initial_clusters=st.session_state.initial_clusters, version="QGeo Web workspace 2")
+                seed=0, initial_clusters=st.session_state.initial_clusters,
+                protocol_steps=st.session_state.get("protocol_steps", []), version="QGeo Web workspace 3")
 a, b = st.columns(2)
 a.download_button("Download measurements (CSV)", csv_bytes(rows), "qgeo_objects.csv", "text/csv", disabled=not rows)
 b.download_button("Download results and masks (ZIP)", export_zip(crop,masks,names,rows,summaries,metadata), "qgeo_results.zip", "application/zip")
